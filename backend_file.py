@@ -13,8 +13,10 @@ import os
 import uuid
 import shutil
 import logging
+import re
+import requests
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from collections import deque
 
@@ -69,6 +71,7 @@ VOICE_DIR.mkdir(parents=True, exist_ok=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()  # "gemini" or "openai"
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 # Embedding model (runs locally, no API key needed)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
@@ -149,14 +152,39 @@ class VoiceOverviewResponse(BaseModel):
     summary_text: str
     file_name: Optional[str] = None
 
-class MindMapRequest(BaseModel):
+class ConceptMapRequest(BaseModel):
     file_name: Optional[str] = None   # None → use all indexed docs
     output_format: Optional[str] = "mermaid"  # "mermaid" or "json"
 
-class MindMapResponse(BaseModel):
-    mind_map: str          # Mermaid diagram string OR JSON string
+class ConceptMapResponse(BaseModel):
+    concept_map: str       # Mermaid diagram string OR JSON string
     output_format: str
     file_name: Optional[str] = None
+
+class YouTubeSearchRequest(BaseModel):
+    topic: Optional[str] = None          # Override auto-detected topic
+    file_name: Optional[str] = None      # Detect topic from a specific file
+    language_code: Optional[str] = None  # BCP-47 code e.g. "hi" for Hindi, "es" for Spanish
+    max_duration_minutes: Optional[int] = None  # Filter: only return videos ≤ this duration
+    sort_by: Optional[str] = "views"     # "views" | "relevance" | "rating" | "date"
+    max_results: Optional[int] = 5       # How many videos to return (1–10)
+
+class YouTubeVideoItem(BaseModel):
+    title: str
+    channel: str
+    url: str
+    thumbnail: str
+    duration_seconds: int
+    duration_label: str
+    view_count: int
+    like_count: int
+    published_at: str
+    description_snippet: str
+
+class YouTubeSearchResponse(BaseModel):
+    topic: str
+    videos: List[YouTubeVideoItem]
+    total_returned: int
 
 # ─────────────────────────────────────────────
 # UTILITY: Session Memory
@@ -693,15 +721,15 @@ async def download_voice_overview(filename: str):
 
 
 # ─────────────────────────────────────────────
-# MIND MAP ROUTE — POST /mindmap
+# CONCEPT MAP ROUTE — POST /concept-map
 # ─────────────────────────────────────────────
 
-@app.post("/mindmap", response_model=MindMapResponse, summary="Generate a mind map from documents")
-async def generate_mindmap(payload: MindMapRequest):
+@app.post("/concept-map", response_model=ConceptMapResponse, summary="Generate a concept map from documents")
+async def generate_concept_map(payload: ConceptMapRequest):
     """
     Analyses the requested document(s) with the LLM and produces either:
-    - A Mermaid.js mindmap diagram string  (output_format="mermaid")
-    - A structured JSON hierarchy          (output_format="json")
+    - A Mermaid.js concept map diagram string  (output_format="mermaid")
+    - A structured JSON hierarchy              (output_format="json")
     """
     # ── Build text sample ──────────────────────────────────────────────────
     if payload.file_name:
@@ -729,7 +757,7 @@ async def generate_mindmap(payload: MindMapRequest):
     # ── Build format-specific prompt ──────────────────────────────────────
     if output_format == "json":
         prompt = f"""You are a knowledge-graph expert.
-Analyse the document content below and produce a hierarchical mind-map as valid JSON.
+Analyse the document content below and produce a hierarchical concept map as valid JSON.
 The JSON must follow this exact schema:
 {{
   "root": "<central topic>",
@@ -746,7 +774,7 @@ Return ONLY the raw JSON — no markdown fences, no extra text.
 DOCUMENT CONTENT:
 {text_sample}
 
-JSON MIND MAP:"""
+JSON CONCEPT MAP:"""
     else:  # mermaid (default)
         prompt = f"""You are a knowledge-graph expert.
 Analyse the document content below and produce a Mermaid.js mindmap diagram.
@@ -769,27 +797,254 @@ Rules:
 DOCUMENT CONTENT:
 {text_sample}
 
-MERMAID MIND MAP:"""
+MERMAID CONCEPT MAP:"""
 
     try:
-        mind_map = call_llm(prompt)
+        concept_map = call_llm(prompt)
     except Exception as e:
-        logger.error(f"Mindmap LLM call failed: {e}")
+        logger.error(f"Concept map LLM call failed: {e}")
         raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
 
     # Strip accidental markdown code fences if the LLM added them
-    mind_map = mind_map.strip()
+    concept_map = concept_map.strip()
     for fence in ("```mermaid", "```json", "```"):
-        if mind_map.startswith(fence):
-            mind_map = mind_map[len(fence):].strip()
-        if mind_map.endswith("```"):
-            mind_map = mind_map[:-3].strip()
+        if concept_map.startswith(fence):
+            concept_map = concept_map[len(fence):].strip()
+        if concept_map.endswith("```"):
+            concept_map = concept_map[:-3].strip()
 
-    logger.info(f"Mind map generated for: {label} (format={output_format})")
-    return MindMapResponse(
-        mind_map=mind_map,
+    logger.info(f"Concept map generated for: {label} (format={output_format})")
+    return ConceptMapResponse(
+        concept_map=concept_map,
         output_format=output_format,
         file_name=payload.file_name,
+    )
+
+
+# ─────────────────────────────────────────────
+# YOUTUBE VIDEO RECOMMENDATIONS — POST /youtube-videos
+# ─────────────────────────────────────────────
+
+def _iso8601_duration_to_seconds(duration: str) -> int:
+    """
+    Convert an ISO 8601 duration string (e.g. 'PT14M33S') to total seconds.
+    Supports hours (H), minutes (M), and seconds (S).
+    """
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration)
+    if not match:
+        return 0
+    hours   = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _seconds_to_label(total_seconds: int) -> str:
+    """Format seconds as a human-readable duration string (e.g. '14m 33s')."""
+    h = total_seconds // 3600
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _detect_topic_from_docs(file_name: Optional[str] = None) -> str:
+    """
+    Use the LLM to extract a concise search-friendly topic from the
+    indexed documents (or a specific file).
+    """
+    if file_name:
+        file_path = UPLOAD_DIR / file_name
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"File '{file_name}' not found.")
+        try:
+            text = extract_text(file_path)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Text extraction failed: {str(e)}")
+        text_sample = text[:6000]
+    else:
+        all_docs = vector_store.get()
+        if not all_docs or not all_docs.get("documents"):
+            raise HTTPException(
+                status_code=404,
+                detail="No documents indexed yet. Please upload a file first, or provide a 'topic' directly.",
+            )
+        text_sample = "\n\n".join(all_docs["documents"][:20])[:6000]
+
+    prompt = f"""Read the following document excerpt and identify the single most specific, \
+searchable topic it covers. Reply with ONLY a short search query (3-8 words, no punctuation, \
+no quotes) that would return the best YouTube tutorials/explanations about this topic.
+
+DOCUMENT EXCERPT:
+{text_sample}
+
+SEARCH QUERY:"""
+
+    topic = call_llm(prompt).strip().strip('"').strip("'")
+    logger.info(f"Auto-detected YouTube topic: '{topic}'")
+    return topic
+
+
+@app.post(
+    "/youtube-videos",
+    response_model=YouTubeSearchResponse,
+    summary="Find YouTube videos related to your document's topic",
+)
+async def youtube_videos(payload: YouTubeSearchRequest):
+    """
+    Intelligently searches YouTube for videos related to the uploaded documents.
+
+    Features:
+    - Auto-detects topic from uploaded documents (or accepts a manual override)
+    - Filter by **language** (e.g. Hindi, Spanish, French)
+    - Filter by **max duration** in minutes
+    - Sort by **view count**, **relevance**, **rating**, or **upload date**
+    - Returns enriched metadata: views, likes, duration, channel, thumbnail, URL
+    """
+    if not YOUTUBE_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="YOUTUBE_API_KEY is not configured. Add it to your .env file. "
+                   "Get a free key at: https://console.developers.google.com/",
+        )
+
+    # ── 1. Determine topic ────────────────────────────────────────────────
+    if payload.topic and payload.topic.strip():
+        topic = payload.topic.strip()
+    else:
+        topic = _detect_topic_from_docs(payload.file_name)
+
+    # ── 2. Build search order param ───────────────────────────────────────
+    sort_map = {
+        "views":     "viewCount",
+        "relevance": "relevance",
+        "rating":    "rating",
+        "date":      "date",
+    }
+    order = sort_map.get((payload.sort_by or "views").lower(), "viewCount")
+
+    # ── 3. Build duration filter ──────────────────────────────────────────
+    # YouTube API duration buckets: "short" (<4 min), "medium" (4–20 min), "long" (>20 min)
+    video_duration = None
+    if payload.max_duration_minutes is not None:
+        if payload.max_duration_minutes <= 4:
+            video_duration = "short"
+        elif payload.max_duration_minutes <= 20:
+            video_duration = "medium"
+        else:
+            video_duration = "long"   # We'll post-filter precisely below
+
+    # ── 4. YouTube Data API v3 — Search ───────────────────────────────────
+    search_url = "https://www.googleapis.com/youtube/v3/search"
+    search_params: dict = {
+        "part":       "snippet",
+        "q":          topic,
+        "type":       "video",
+        "order":      order,
+        "maxResults": min(max(payload.max_results or 5, 1), 10) * 3,  # Fetch extra for post-filtering
+        "key":        YOUTUBE_API_KEY,
+        "safeSearch": "moderate",
+        "videoEmbeddable": "true",
+    }
+    if payload.language_code:
+        search_params["relevanceLanguage"] = payload.language_code
+    if video_duration:
+        search_params["videoDuration"] = video_duration
+
+    try:
+        search_resp = requests.get(search_url, params=search_params, timeout=10)
+        search_resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"YouTube search API error: {e}")
+        raise HTTPException(status_code=502, detail=f"YouTube API request failed: {str(e)}")
+
+    search_data = search_resp.json()
+    items = search_data.get("items", [])
+
+    if not items:
+        return YouTubeSearchResponse(topic=topic, videos=[], total_returned=0)
+
+    # ── 5. YouTube Data API v3 — Video Details (stats + contentDetails) ───
+    video_ids = ",".join(item["id"]["videoId"] for item in items if "videoId" in item["id"])
+    details_url = "https://www.googleapis.com/youtube/v3/videos"
+    details_params = {
+        "part": "statistics,contentDetails,snippet",
+        "id":   video_ids,
+        "key":  YOUTUBE_API_KEY,
+    }
+
+    try:
+        details_resp = requests.get(details_url, params=details_params, timeout=10)
+        details_resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"YouTube details API error: {e}")
+        raise HTTPException(status_code=502, detail=f"YouTube details API request failed: {str(e)}")
+
+    details_data = details_resp.json()
+    details_by_id = {v["id"]: v for v in details_data.get("items", [])}
+
+    # ── 6. Build enriched results with post-filtering ─────────────────────
+    max_results = min(max(payload.max_results or 5, 1), 10)
+    max_duration_secs = (payload.max_duration_minutes * 60) if payload.max_duration_minutes else None
+
+    videos: list[YouTubeVideoItem] = []
+    for item in items:
+        vid_id = item["id"].get("videoId")
+        if not vid_id or vid_id not in details_by_id:
+            continue
+
+        detail = details_by_id[vid_id]
+        stats   = detail.get("statistics", {})
+        content = detail.get("contentDetails", {})
+        snippet = detail.get("snippet", {})
+
+        # Duration
+        duration_secs = _iso8601_duration_to_seconds(content.get("duration", "PT0S"))
+
+        # Post-filter by precise max_duration_minutes
+        if max_duration_secs is not None and duration_secs > max_duration_secs:
+            continue
+
+        view_count = int(stats.get("viewCount", 0))
+        like_count = int(stats.get("likeCount", 0))
+
+        # Thumbnail — prefer high-res
+        thumbnails = snippet.get("thumbnails", {})
+        thumbnail = (
+            thumbnails.get("high", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or thumbnails.get("default", {}).get("url")
+            or ""
+        )
+
+        description = snippet.get("description", "")
+        description_snippet = description[:200] + "..." if len(description) > 200 else description
+
+        videos.append(YouTubeVideoItem(
+            title=snippet.get("title", "Untitled"),
+            channel=snippet.get("channelTitle", "Unknown"),
+            url=f"https://www.youtube.com/watch?v={vid_id}",
+            thumbnail=thumbnail,
+            duration_seconds=duration_secs,
+            duration_label=_seconds_to_label(duration_secs),
+            view_count=view_count,
+            like_count=like_count,
+            published_at=snippet.get("publishedAt", ""),
+            description_snippet=description_snippet,
+        ))
+
+        if len(videos) >= max_results:
+            break
+
+    logger.info(f"YouTube search: topic='{topic}', returned={len(videos)} videos")
+    return YouTubeSearchResponse(
+        topic=topic,
+        videos=videos,
+        total_returned=len(videos),
     )
 
 
